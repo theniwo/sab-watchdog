@@ -68,10 +68,10 @@ while True:
     speed, slots, status = get_download_rate()
     log_message(f"⬇️  Speed: {speed:.0f} B/s | Active Jobs: {slots} | Status: {status}")
 
-    # Logic for unpausing SABnzbd if it's paused with or without active downloads
+    # Logic for unpausing SABnzbd if its overall status is "Paused"
     if status == "Paused":
         paused_zero_counter += 1
-        log_message(f"⏱️  SABnzbd is paused ({paused_zero_counter}/{MAX_PAUSED_ZERO_COUNT})")
+        log_message(f"⏱️  SABnzbd is currently in 'Paused' status ({paused_zero_counter}/{MAX_PAUSED_ZERO_COUNT})")
         if paused_zero_counter >= MAX_PAUSED_ZERO_COUNT:
             log_message("💡 Attempting to unpause SABnzbd...")
             if resume_sabnzbd():
@@ -80,8 +80,10 @@ while True:
     else:
         paused_zero_counter = 0 # Reset if not paused
 
-    # Logic for restarting due to hanging downloads (ONLY if not paused)
-    # Check if there are active slots, speed is zero, AND SABnzbd is not paused
+    # Logic for restarting due to hanging downloads
+    # A "hang" is detected if there are active slots, speed is zero,
+    # AND the overall SABnzbd status is NOT "Paused".
+    # This specifically targets "Idle" or "Downloading" states where activity stalled.
     if slots > 0 and speed == 0 and status != "Paused": # <-- Wichtige Änderung hier!
         zero_counter += 1
         log_message(f"⏱️  Hanging detected ({zero_counter}/{MAX_ZERO_COUNT})")
