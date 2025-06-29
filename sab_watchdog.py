@@ -11,18 +11,16 @@ SABNZBD_URL = os.environ.get("SABNZBD_URL", "http://sabnzbd:8080")
 CONTAINER_NAME = os.environ.get("SABNZBD_CONTAINER", "sabnzbd")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", 60))          # Sekunden zwischen Checks
 MAX_ZERO_COUNT = int(os.environ.get("MAX_ZERO_COUNT", 3))           # Wie oft 0 B/s erlaubt ist, bevor neu gestartet wird
-
 # Zusätzliche Konfiguration für Entpausieren
-# Wie oft SABnzbd bei 0 B/s und Pausierung überprüft wird, bevor entpausiert wird
-MAX_PAUSED_ZERO_COUNT = int(os.environ.get("MAX_PAUSED_ZERO_COUNT", 5))
+MAX_PAUSED_COUNT = int(os.environ.get("MAX_PAUSED_COUNT", 5))       # Wie oft SABnzbd im Pausiert-Status überprüft wird, bevor entpausiert wird
 
 # Abbruch bei fehlender API
 if not API_KEY:
     print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ❌ Environment variable SABNZBD_APIKEY is missing.", flush=True)
     sys.exit(1)
 
-zero_counter = 0
-paused_zero_counter = 0
+zero_speed_hang_counter = 0 # Zähler für hängende Downloads (Status "Downloading", aber 0 B/s)
+paused_status_counter = 0   # Zähler für den Status "Paused"
 
 def log_message(message):
     """Prints a message with a timestamp."""
@@ -37,6 +35,7 @@ def get_download_rate():
         data = resp.json()
         queue = data["queue"]
         speed_bps = float(queue["kbpersec"]) * 1024
+        # SABnzbd API queue status can be 'Paused', 'Downloading', 'Idle'
         return speed_bps, int(queue["noofslots"]), queue["status"]
     except requests.exceptions.RequestException as e:
         log_message(f"⚠️  Error fetching queue info: {e}")
@@ -70,30 +69,29 @@ while True:
 
     # Logic for unpausing SABnzbd if its overall status is "Paused"
     if status == "Paused":
-        paused_zero_counter += 1
-        log_message(f"⏱️  SABnzbd is currently in 'Paused' status ({paused_zero_counter}/{MAX_PAUSED_ZERO_COUNT})")
-        if paused_zero_counter >= MAX_PAUSED_ZERO_COUNT:
+        paused_status_counter += 1
+        log_message(f"⏱️  SABnzbd is currently in 'Paused' status ({paused_status_counter}/{MAX_PAUSED_COUNT})")
+        if paused_status_counter >= MAX_PAUSED_COUNT:
             log_message("💡 Attempting to unpause SABnzbd...")
             if resume_sabnzbd():
-                paused_zero_counter = 0 # Reset after successful unpause
+                paused_status_counter = 0 # Reset after successful unpause
             # If unpause fails, counter is not reset, it will retry after next interval
     else:
-        paused_zero_counter = 0 # Reset if not paused
+        paused_status_counter = 0 # Reset if not paused
 
-    # Logic for restarting due to hanging downloads
-    # A "hang" is detected if there are active slots, speed is zero,
-    # AND the overall SABnzbd status is NOT "Paused".
-    # This specifically targets "Idle" or "Downloading" states where activity stalled.
-    if slots > 0 and speed == 0 and status != "Paused": # <-- Wichtige Änderung hier!
-        zero_counter += 1
-        log_message(f"⏱️  Hanging detected ({zero_counter}/{MAX_ZERO_COUNT})")
+    # Logic for restarting due to true hanging downloads
+    # A "true hang" is detected ONLY if SABnzbd reports "Downloading" status
+    # but the actual speed is 0 B/s. This avoids restarts for "Idle" or "Paused" states.
+    if status == "Downloading" and speed == 0: # <-- Entscheidende Änderung hier!
+        zero_speed_hang_counter += 1
+        log_message(f"⏱️  Download hanging detected (Status: {status}, Speed: {speed:.0f} B/s) ({zero_speed_hang_counter}/{MAX_ZERO_COUNT})")
     else:
-        zero_counter = 0
+        zero_speed_hang_counter = 0 # Reset if conditions for hanging are not met
 
-    if zero_counter >= MAX_ZERO_COUNT:
-        log_message("🚨 Restarting SABnzbd container now...")
+    if zero_speed_hang_counter >= MAX_ZERO_COUNT:
+        log_message("🚨 Restarting SABnzbd container now due to sustained download hang...")
         os.system(f"docker restart {CONTAINER_NAME}")
-        zero_counter = 0
-        paused_zero_counter = 0 # Reset paused counter after restart
+        zero_speed_hang_counter = 0
+        paused_status_counter = 0 # Reset all counters after restart
 
     time.sleep(CHECK_INTERVAL)
