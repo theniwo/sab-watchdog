@@ -3,7 +3,7 @@ import requests
 import time
 import os
 import sys
-from datetime import datetime # Importiere das datetime-Modul
+from datetime import datetime
 
 # Konfiguration aus Umgebungsvariablen
 API_KEY = os.environ.get("SABNZBD_APIKEY")
@@ -22,7 +22,7 @@ if not API_KEY:
     sys.exit(1)
 
 zero_counter = 0
-paused_zero_counter = 0 # Zähler für den Pausierungs-Check
+paused_zero_counter = 0
 
 def log_message(message):
     """Prints a message with a timestamp."""
@@ -33,11 +33,11 @@ def get_download_rate():
     try:
         url = f"{SABNZBD_URL}/api?mode=queue&output=json&apikey={API_KEY}"
         resp = requests.get(url, timeout=5)
-        resp.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        resp.raise_for_status()
         data = resp.json()
         queue = data["queue"]
-        speed_bps = float(queue["kbpersec"]) * 1024  # Convert kb/s to B/s
-        return speed_bps, int(queue["noofslots"]), queue["status"] # Return overall queue status
+        speed_bps = float(queue["kbpersec"]) * 1024
+        return speed_bps, int(queue["noofslots"]), queue["status"]
     except requests.exceptions.RequestException as e:
         log_message(f"⚠️  Error fetching queue info: {e}")
         return -1, 0, "Error"
@@ -68,8 +68,21 @@ while True:
     speed, slots, status = get_download_rate()
     log_message(f"⬇️  Speed: {speed:.0f} B/s | Active Jobs: {slots} | Status: {status}")
 
-    # Logic for restarting due to hanging downloads
-    if slots > 0 and speed == 0:
+    # Logic for unpausing SABnzbd if it's paused with or without active downloads
+    if status == "Paused":
+        paused_zero_counter += 1
+        log_message(f"⏱️  SABnzbd is paused ({paused_zero_counter}/{MAX_PAUSED_ZERO_COUNT})")
+        if paused_zero_counter >= MAX_PAUSED_ZERO_COUNT:
+            log_message("💡 Attempting to unpause SABnzbd...")
+            if resume_sabnzbd():
+                paused_zero_counter = 0 # Reset after successful unpause
+            # If unpause fails, counter is not reset, it will retry after next interval
+    else:
+        paused_zero_counter = 0 # Reset if not paused
+
+    # Logic for restarting due to hanging downloads (ONLY if not paused)
+    # Check if there are active slots, speed is zero, AND SABnzbd is not paused
+    if slots > 0 and speed == 0 and status != "Paused": # <-- Wichtige Änderung hier!
         zero_counter += 1
         log_message(f"⏱️  Hanging detected ({zero_counter}/{MAX_ZERO_COUNT})")
     else:
@@ -80,17 +93,5 @@ while True:
         os.system(f"docker restart {CONTAINER_NAME}")
         zero_counter = 0
         paused_zero_counter = 0 # Reset paused counter after restart
-
-    # Logic for unpausing SABnzbd if it's paused with no active downloads
-    if status == "Paused" and slots == 0:
-        paused_zero_counter += 1
-        log_message(f"⏱️  SABnzbd is paused with no active downloads ({paused_zero_counter}/{MAX_PAUSED_ZERO_COUNT})")
-        if paused_zero_counter >= MAX_PAUSED_ZERO_COUNT:
-            log_message("💡 Attempting to unpause SABnzbd...")
-            if resume_sabnzbd():
-                paused_zero_counter = 0 # Reset after successful unpause
-            # If unpause fails, counter is not reset, it will retry after next interval
-    else:
-        paused_zero_counter = 0 # Reset if not paused or if there are active downloads
 
     time.sleep(CHECK_INTERVAL)
