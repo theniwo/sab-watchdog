@@ -13,6 +13,8 @@ CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", 60))          # Sekunden z
 MAX_ZERO_COUNT = int(os.environ.get("MAX_ZERO_COUNT", 3))           # Wie oft 0 B/s erlaubt ist, bevor neu gestartet wird
 
 # Zusätzliche Konfiguration für Entpausieren
+# Wie oft SABnzbd im Pausiert-Status überprüft wird, bevor entpausiert wird,
+# wenn keine Post-Processing-Jobs laufen.
 MAX_PAUSED_COUNT_FOR_UNPAUSE = int(os.environ.get("MAX_PAUSED_COUNT_FOR_UNPAUSE", 5))
 
 # Abbruch bei fehlender API
@@ -21,10 +23,11 @@ if not API_KEY:
     sys.exit(1)
 
 # Zähler
-zero_speed_hang_counter = 0     # Zähler für hängende Downloads (Aktive Slots, 0 B/s, NICHT Pausiert)
+zero_speed_hang_counter = 0     # Zähler für hängende Downloads (Status "Downloading", aber 0 B/s)
 sabnzbd_paused_counter = 0      # Zähler für den Gesamtstatus "Paused"
 post_processing_active_counter = 0 # Zähler, wenn Post-Processing läuft während SABnzbd pausiert ist
 
+# Definition von Post-Processing-Status in SABnzbd (Basierend auf API-Dokumentation)
 POST_PROCESSING_STATES = ["Verifying", "Extracting", "Moving", "Renaming", "Repairing", "Grabbing"]
 
 def log_message(message):
@@ -40,13 +43,17 @@ def get_queue_info():
         data = resp.json()
         queue = data["queue"]
         speed_bps = float(queue["kbpersec"]) * 1024
+        # SABnzbd API queue status can be 'Paused', 'Downloading', 'Idle'
         overall_status = queue["status"]
+        # noofslots counts items with status 'Downloading' (actual downloads)
+        # and also 'Queued' items that are next in line. It does NOT count post-processing.
         active_download_slots = int(queue["noofslots"])
 
+        # Check individual items for post-processing states
         is_post_processing_active = False
-        if "slots" in queue:
+        # The 'jobs' list contains all queue items, regardless of their main queue status
+        if "slots" in queue: # Check if 'slots' key exists in queue response
             for job_slot in queue["slots"]:
-                # Check for individual job status indicating post-processing
                 if job_slot.get("status") in POST_PROCESSING_STATES:
                     is_post_processing_active = True
                     break
@@ -79,12 +86,11 @@ def resume_sabnzbd():
 log_message("🚀 SABnzbd Watchdog started")
 
 while True:
+    # Abrufen der erweiterten Queue-Informationen
     speed, active_download_slots, overall_status, is_post_processing_active = get_queue_info()
     log_message(f"⬇️  Speed: {speed:.0f} B/s | Active Downloads (slots): {active_download_slots} | SAB Status: {overall_status} | Post-Processing Active: {is_post_processing_active}")
 
-    # --- Logik für das Entpausieren von SABnzbd ---
-    # SABnzbd wird nur entpausiert, wenn es den Gesamtstatus "Paused" hat
-    # UND kein Post-Processing aktiv ist.
+    # Logik für das Entpausieren von SABnzbd (nur wenn es explizit pausiert ist UND kein Post-Processing läuft)
     if overall_status == "Paused":
         if is_post_processing_active:
             post_processing_active_counter += 1
@@ -98,21 +104,20 @@ while True:
             if sabnzbd_paused_counter >= MAX_PAUSED_COUNT_FOR_UNPAUSE:
                 log_message("💡 Attempting to unpause SABnzbd (paused without active Post-Processing)...")
                 if resume_sabnzbd():
-                    sabnzbd_paused_counter = 0
+                    sabnzbd_paused_counter = 0 # Reset after successful unpause
+                # If unpause fails, counter is not reset, it will retry after next interval
     else: # SABnzbd is not in overall "Paused" status
-        sabnzbd_paused_counter = 0
-        post_processing_active_counter = 0
+        sabnzbd_paused_counter = 0 # Reset paused counter
+        post_processing_active_counter = 0 # Reset PP counter
 
 
-    # --- Logik für den Neustart bei echten Hängepartien ---
-    # Ein "echter Hänger" liegt vor, wenn:
-    # 1. Es gibt mindestens einen aktiven Download-Slot (> 0).
-    # 2. Die Download-Geschwindigkeit ist 0 B/s.
-    # 3. Der Gesamtstatus ist NICHT "Paused" (da dieser Fall von der Entpausierungslogik behandelt wird).
-    # Dies fängt sowohl "Downloading" mit 0 B/s als auch "Idle" mit aktiven Slots und 0 B/s ab.
-    if active_download_slots > 0 and speed == 0 and overall_status != "Paused": # <-- Wichtige Änderung hier!
+    # Logik für den Neustart bei echten Hängepartien
+    # Ein "echter Hänger" liegt nur vor, wenn SABnzbd den Gesamtstatus "Downloading" meldet,
+    # aber die Geschwindigkeit 0 B/s beträgt. Dies ignoriert pausierte Einzel-Downloads
+    # oder "Idle"-Zustände, die nicht wirklich hängen.
+    if overall_status == "Downloading" and speed == 0:
         zero_speed_hang_counter += 1
-        log_message(f"⏱️  Potential download hang detected (SAB Status: {overall_status}, Speed: {speed:.0f} B/s, Slots: {active_download_slots}) ({zero_speed_hang_counter}/{MAX_ZERO_COUNT})")
+        log_message(f"⏱️  Download hanging detected (SAB Status: {overall_status}, Speed: {speed:.0f} B/s) ({zero_speed_hang_counter}/{MAX_ZERO_COUNT})")
     else:
         zero_speed_hang_counter = 0 # Reset if conditions for hanging are not met
 
