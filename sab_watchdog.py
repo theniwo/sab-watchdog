@@ -37,7 +37,18 @@ post_processing_active_counter = 0
 disk_full_counter = 0
 disk_full_restart_counter = 0
 
-POST_PROCESSING_STATES = ["Verifying", "Extracting", "Moving", "Renaming", "Repairing", "Grabbing"]
+# --- ANGEPASST: Post-Processing-Zustände mit beiden Varianten (mit und ohne Doppelpunkt) ---
+POST_PROCESSING_STATES = [
+    "Verifying", "Verifying:",
+    "Extracting", "Extracting:",
+    "Moving", "Moving:",
+    "Renaming", "Renaming:",
+    "Repairing", "Repairing:",
+    "Grabbing", "Grabbing:",
+    "Copying", "Copying:",
+    "Direct Unpack", "Direct Unpack:"
+]
+
 
 def log_message(message):
     """Prints a message with a timestamp."""
@@ -79,6 +90,7 @@ def get_queue_info():
         if "slots" in queue:
             for job_slot in queue["slots"]:
                 queue_items.append(job_slot)
+                # Überprüfe den Status jedes Jobs gegen die erweiterte PP-Zustandsliste
                 if job_slot.get("status") in POST_PROCESSING_STATES:
                     is_post_processing_active = True
 
@@ -145,11 +157,11 @@ def reset_sabnzbd_queue():
 log_message("🚀 SABnzbd Watchdog started")
 
 while True:
-    # Initialer Abruf der Queue-Informationen
     speed, active_download_slots, overall_status, is_post_processing_active, disk_space_free_gb, queue_items = get_queue_info()
     log_message(f"⬇️  Speed: {speed:.0f} B/s | Active Downloads (slots): {active_download_slots} | SAB Status: {overall_status} | Post-Processing Active: {is_post_processing_active} | Disk Free: {disk_space_free_gb:.2f} GB")
 
     # --- Logik für das Entpausieren von SABnzbd ---
+    # Diese Logik wird NICHT aktiv, wenn is_post_processing_active TRUE ist
     if overall_status == "Paused":
         if is_post_processing_active:
             post_processing_active_counter += 1
@@ -207,12 +219,9 @@ while True:
                     log_message(f"⚠️  Disk full, but largest identified job '{job_name}' ({estimated_needed_gb:.2f} GB) is not solely responsible for full disk. Deleting it as a primary measure to free space.")
                     deletion_successful = delete_sabnzbd_job(nzo_id, job_name)
 
-                # --- Wichtige NEUE Logik: Überprüfung des Speicherplatzes nach dem Löschen ---
                 if deletion_successful:
-                    # Kurze Pause geben, damit SABnzbd intern aufräumen kann
                     time.sleep(5)
 
-                    # Erneuten Abruf der Queue-Informationen und des aktuellen freien Speicherplatzes
                     _, _, _, _, current_disk_free_gb, _ = get_queue_info()
                     log_message(f"🔄 Re-checking disk space after deletion attempt: {current_disk_free_gb:.2f} GB free.")
 
@@ -222,12 +231,11 @@ while True:
 
                         if disk_full_restart_counter >= RESTART_ON_DISK_FULL_FAIL_COUNT:
                             log_message("Attempting to reset SABnzbd queue to clear potential inconsistencies before restart...")
-                            reset_sabnzbd_queue() # NEUER SCHRITT: Queue reset
-                            time.sleep(5) # Wartezeit für den Reset
+                            reset_sabnzbd_queue()
+                            time.sleep(5)
 
                             log_message("🚨 Sustained low disk space after deletion and queue reset, restarting SABnzbd container to force cleanup and reset.")
                             os.system(f"docker restart {CONTAINER_NAME}")
-                            # Reset all counters after restart
                             zero_speed_hang_counter = 0
                             sabnzbd_paused_counter = 0
                             post_processing_active_counter = 0
@@ -244,15 +252,16 @@ while True:
                 log_message("⚠️  Low disk space detected, but no suitable download job found in queue to delete.")
                 disk_full_restart_counter = 0
 
-    else: # Disk space is above threshold
+    else:
         disk_full_counter = 0
         disk_full_restart_counter = 0
 
 
     # --- Logik für den Neustart bei echten Hängepartien ---
-    if overall_status == "Downloading" and speed == 0:
+    # Diese Logik wird NICHT aktiv, wenn Post-Processing aktiv ist
+    if overall_status == "Downloading" and speed == 0 and not is_post_processing_active:
         zero_speed_hang_counter += 1
-        log_message(f"⏱️  Download hanging detected (SAB Status: {overall_status}, Speed: {speed:.0f} B/s) ({zero_speed_hang_counter}/{MAX_ZERO_COUNT})")
+        log_message(f"⏱️  Download hanging detected (SAB Status: {overall_status}, Speed: {speed:.0f} B/s, No PP Active) ({zero_speed_hang_counter}/{MAX_ZERO_COUNT})")
     else:
         zero_speed_hang_counter = 0
 
