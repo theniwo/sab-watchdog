@@ -22,6 +22,8 @@ MAX_DISK_FULL_COUNT = int(os.environ.get("MAX_DISK_FULL_COUNT", 2))
 # Puffer in GB, den der Download mindestens UNTER dem freien Speicherplatz liegen sollte,
 # um nicht als "zu groß" zu gelten. Erhöht die Toleranz.
 SIZE_CHECK_BUFFER_GB = float(os.environ.get("SIZE_CHECK_BUFFER_GB", 1.0))
+# Wie oft ein Neustart versucht wird, wenn Löschen bei Disk Full nicht geholfen hat
+RESTART_ON_DISK_FULL_FAIL_COUNT = int(os.environ.get("RESTART_ON_DISK_FULL_FAIL_COUNT", 1))
 
 # Abbruch bei fehlender API
 if not API_KEY:
@@ -33,6 +35,7 @@ zero_speed_hang_counter = 0
 sabnzbd_paused_counter = 0
 post_processing_active_counter = 0
 disk_full_counter = 0
+disk_full_restart_counter = 0
 
 POST_PROCESSING_STATES = ["Verifying", "Extracting", "Moving", "Renaming", "Repairing", "Grabbing"]
 
@@ -43,7 +46,6 @@ def log_message(message):
 def parse_sab_size_string(size_str):
     """Parses SABnzbd size string (e.g., "10.23 GB") into float in GB."""
     try:
-        # SABnzbd usually reports GB, but handle other units if they appear
         size_str = size_str.strip()
         if size_str.endswith(' GB'):
             return float(size_str.replace(' GB', ''))
@@ -51,9 +53,9 @@ def parse_sab_size_string(size_str):
             return float(size_str.replace(' MB', '')) / 1024
         elif size_str.endswith(' KB'):
             return float(size_str.replace(' KB', '')) / (1024 * 1024)
-        return float(size_str) # Fallback if no unit or already a number
+        return float(size_str)
     except ValueError:
-        return 0.0 # Return 0 if parsing fails
+        return 0.0
 
 def get_queue_info():
     """
@@ -70,8 +72,7 @@ def get_queue_info():
         overall_status = queue["status"]
         active_download_slots = int(queue["noofslots"])
 
-        disk_space_free_gb = parse_sab_size_string(queue["diskspace1"]) # Use diskspace1 for temp folder
-        # diskspace2 for completed folder
+        disk_space_free_gb = parse_sab_size_string(queue["diskspace1"])
 
         is_post_processing_active = False
         queue_items = []
@@ -114,18 +115,37 @@ def delete_sabnzbd_job(nzo_id, job_name="N/A"):
         resp.raise_for_status()
         data = resp.json()
         if data.get("status"):
-            log_message(f"✅ Job '{job_name}' (ID: {nzo_id}) successfully deleted from SABnzbd queue.")
+            log_message(f"✅ Job '{job_name}' (ID: {nzo_id}) successfully deleted from SABnzbd queue via API.")
             return True
         else:
-            log_message(f"❌ Failed to delete job '{job_name}' (ID: {nzo_id}) from SABnzbd queue: {data}")
+            log_message(f"❌ Failed to delete job '{job_name}' (ID: {nzo_id}) from SABnzbd queue via API: {data}")
             return False
     except requests.exceptions.RequestException as e:
         log_message(f"⚠️  Error sending delete command for job '{job_name}' (ID: {nzo_id}): {e}")
         return False
 
+def reset_sabnzbd_queue():
+    """Sends the reset command to SABnzbd API to fix potential queue inconsistencies."""
+    try:
+        url = f"{SABNZBD_URL}/api?mode=queue&name=reset&output=json&apikey={API_KEY}"
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("status"):
+            log_message("✅ SABnzbd queue reset/repair command sent via API.")
+            return True
+        else:
+            log_message(f"❌ Failed to send SABnzbd queue reset/repair command via API: {data}")
+            return False
+    except requests.exceptions.RequestException as e:
+        log_message(f"⚠️  Error sending queue reset command: {e}")
+        return False
+
+
 log_message("🚀 SABnzbd Watchdog started")
 
 while True:
+    # Initialer Abruf der Queue-Informationen
     speed, active_download_slots, overall_status, is_post_processing_active, disk_space_free_gb, queue_items = get_queue_info()
     log_message(f"⬇️  Speed: {speed:.0f} B/s | Active Downloads (slots): {active_download_slots} | SAB Status: {overall_status} | Post-Processing Active: {is_post_processing_active} | Disk Free: {disk_space_free_gb:.2f} GB")
 
@@ -159,18 +179,13 @@ while True:
             job_to_delete = None
             max_potential_size_gb = 0.0
 
-            # Finden des größten Jobs in der gesamten Queue (egal ob Downloading, Queued, Paused)
-            # der potenziell das Problem verursacht.
             for job in queue_items:
-                # Überspringe bereits abgeschlossene oder in der Nachbearbeitung befindliche Jobs
                 if job.get("status") in ["Completed", "Failed"] or job.get("status") in POST_PROCESSING_STATES:
                     continue
 
-                # Für aktuell herunterladende Jobs, nutze 'sizeleft' als Indikator für den sofortigen Platzbedarf
                 if job.get("status") == "Downloading":
                     job_current_size_check = parse_sab_size_string(job.get("sizeleft", "0 GB"))
                 else:
-                    # Für alle anderen Jobs (queued, paused etc.), nutze die Gesamtgröße 'size'
                     job_current_size_check = parse_sab_size_string(job.get("size", "0 GB"))
 
                 if job_current_size_check > max_potential_size_gb:
@@ -180,33 +195,59 @@ while True:
             if job_to_delete:
                 nzo_id = job_to_delete.get("nzo_id")
                 job_name = job_to_delete.get("filename", "N/A")
-                estimated_needed_gb = parse_sab_size_string(job_to_delete.get("size", "0 GB")) # Gesamtgröße für Log
+                estimated_needed_gb = parse_sab_size_string(job_to_delete.get("size", "0 GB"))
 
                 log_message(f"ℹ️  Identified problematic job '{job_name}' (ID: {nzo_id}). Estimated total size: {estimated_needed_gb:.2f} GB.")
 
-                # Löschen, wenn der Job alleine zu groß ist
+                deletion_successful = False
                 if estimated_needed_gb > (disk_space_free_gb + SIZE_CHECK_BUFFER_GB):
                     log_message(f"🗑️  Job '{job_name}' is too large ({estimated_needed_gb:.2f} GB) for available space ({disk_space_free_gb:.2f} GB + {SIZE_CHECK_BUFFER_GB} GB buffer). Deleting...")
-                    if delete_sabnzbd_job(nzo_id, job_name):
-                        disk_full_counter = 0 # Reset after action
-                        sabnzbd_paused_counter = 0 # Reset paused counter as disk issue might be resolved
-                        post_processing_active_counter = 0 # Reset PP counter
+                    deletion_successful = delete_sabnzbd_job(nzo_id, job_name)
                 else:
-                    # Wenn der größte Job alleine nicht zu groß ist, aber Disk immer noch voll,
-                    # dann liegt es an der Summe mehrerer Jobs oder einem anderen Problem.
-                    # Als Fallback löschen wir den identifizierten größten Job, um Platz zu schaffen.
                     log_message(f"⚠️  Disk full, but largest identified job '{job_name}' ({estimated_needed_gb:.2f} GB) is not solely responsible for full disk. Deleting it as a primary measure to free space.")
-                    if delete_sabnzbd_job(nzo_id, job_name):
-                        disk_full_counter = 0 # Reset after action
-                        sabnzbd_paused_counter = 0 # Reset paused counter as disk issue might be resolved
-                        post_processing_active_counter = 0 # Reset PP counter
+                    deletion_successful = delete_sabnzbd_job(nzo_id, job_name)
+
+                # --- Wichtige NEUE Logik: Überprüfung des Speicherplatzes nach dem Löschen ---
+                if deletion_successful:
+                    # Kurze Pause geben, damit SABnzbd intern aufräumen kann
+                    time.sleep(5)
+
+                    # Erneuten Abruf der Queue-Informationen und des aktuellen freien Speicherplatzes
+                    _, _, _, _, current_disk_free_gb, _ = get_queue_info()
+                    log_message(f"🔄 Re-checking disk space after deletion attempt: {current_disk_free_gb:.2f} GB free.")
+
+                    if current_disk_free_gb < DISK_FREE_THRESHOLD_GB:
+                        disk_full_restart_counter += 1
+                        log_message(f"❌ Disk space still critically low ({current_disk_free_gb:.2f} GB) after deleting job. File data likely not removed. ({disk_full_restart_counter}/{RESTART_ON_DISK_FULL_FAIL_COUNT})")
+
+                        if disk_full_restart_counter >= RESTART_ON_DISK_FULL_FAIL_COUNT:
+                            log_message("Attempting to reset SABnzbd queue to clear potential inconsistencies before restart...")
+                            reset_sabnzbd_queue() # NEUER SCHRITT: Queue reset
+                            time.sleep(5) # Wartezeit für den Reset
+
+                            log_message("🚨 Sustained low disk space after deletion and queue reset, restarting SABnzbd container to force cleanup and reset.")
+                            os.system(f"docker restart {CONTAINER_NAME}")
+                            # Reset all counters after restart
+                            zero_speed_hang_counter = 0
+                            sabnzbd_paused_counter = 0
+                            post_processing_active_counter = 0
+                            disk_full_counter = 0
+                            disk_full_restart_counter = 0
+                    else:
+                        log_message("✅ Disk space successfully increased after deletion. Problem resolved.")
+                        disk_full_counter = 0
+                        sabnzbd_paused_counter = 0
+                        post_processing_active_counter = 0
+                        disk_full_restart_counter = 0
+
             else:
                 log_message("⚠️  Low disk space detected, but no suitable download job found in queue to delete.")
-                # disk_full_counter will continue to increment, potentially leading to no action
-                # if there are no deletable jobs. This prevents infinite loops.
+                disk_full_restart_counter = 0
 
     else: # Disk space is above threshold
-        disk_full_counter = 0 # Reset counter if disk space is fine
+        disk_full_counter = 0
+        disk_full_restart_counter = 0
+
 
     # --- Logik für den Neustart bei echten Hängepartien ---
     if overall_status == "Downloading" and speed == 0:
@@ -221,6 +262,7 @@ while True:
         zero_speed_hang_counter = 0
         sabnzbd_paused_counter = 0
         post_processing_active_counter = 0
-        disk_full_counter = 0 # Reset all counters after restart
+        disk_full_counter = 0
+        disk_full_restart_counter = 0
 
     time.sleep(CHECK_INTERVAL)
