@@ -37,7 +37,7 @@ post_processing_active_counter = 0
 disk_full_counter = 0
 disk_full_restart_counter = 0
 
-# --- ANGEPASST: Post-Processing-Zustände mit beiden Varianten (mit und ohne Doppelpunkt) ---
+# Post-Processing-Zustände mit beiden Varianten (mit und ohne Doppelpunkt)
 POST_PROCESSING_STATES = [
     "Verifying", "Verifying:",
     "Extracting", "Extracting:",
@@ -257,12 +257,20 @@ while True:
         disk_full_restart_counter = 0
 
 
-    # --- Logik für den Neustart bei echten Hängepartien ---
-    # Diese Logik wird NICHT aktiv, wenn Post-Processing aktiv ist
-    if overall_status == "Downloading" and speed == 0 and not is_post_processing_active:
-        zero_speed_hang_counter += 1
-        log_message(f"⏱️  Download hanging detected (SAB Status: {overall_status}, Speed: {speed:.0f} B/s, No PP Active) ({zero_speed_hang_counter}/{MAX_ZERO_COUNT})")
+    # --- ANGEPASST: Logik für den Neustart bei echten Hängepartien ---
+    # Erkenne Hänger, wenn Geschwindigkeit 0 ist UND
+    # (SAB Status ist "Downloading" ODER SAB Status ist "Idle" ABER es gibt aktive Slots)
+    # UND kein Post-Processing aktiv ist.
+    if speed == 0 and not is_post_processing_active:
+        if overall_status == "Downloading" or \
+           (overall_status == "Idle" and active_download_slots > 0):
+            zero_speed_hang_counter += 1
+            log_message(f"⏱️  Download hanging detected (SAB Status: {overall_status}, Speed: {speed:.0f} B/s, Active Slots: {active_download_slots}, No PP Active) ({zero_speed_hang_counter}/{MAX_ZERO_COUNT})")
+        else:
+            # Zurücksetzen, wenn der Status nicht dem Hänger-Muster entspricht
+            zero_speed_hang_counter = 0
     else:
+        # Zurücksetzen, wenn Geschwindigkeit > 0 oder PP aktiv
         zero_speed_hang_counter = 0
 
     if zero_speed_hang_counter >= MAX_ZERO_COUNT:
