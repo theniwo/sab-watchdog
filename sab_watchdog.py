@@ -19,6 +19,9 @@ MAX_PAUSED_COUNT_FOR_UNPAUSE = int(os.environ.get("MAX_PAUSED_COUNT_FOR_UNPAUSE"
 DISK_FREE_THRESHOLD_GB = float(os.environ.get("DISK_FREE_THRESHOLD_GB", 5.0)) # Schwellenwert in GB
 # Wie oft Disk-Full-Status überprüft wird, bevor gelöscht wird
 MAX_DISK_FULL_COUNT = int(os.environ.get("MAX_DISK_FULL_COUNT", 2))
+# Puffer in GB, den der Download mindestens UNTER dem freien Speicherplatz liegen sollte,
+# um nicht als "zu groß" zu gelten. Erhöht die Toleranz.
+SIZE_CHECK_BUFFER_GB = float(os.environ.get("SIZE_CHECK_BUFFER_GB", 1.0))
 
 # Abbruch bei fehlender API
 if not API_KEY:
@@ -29,13 +32,28 @@ if not API_KEY:
 zero_speed_hang_counter = 0
 sabnzbd_paused_counter = 0
 post_processing_active_counter = 0
-disk_full_counter = 0           # Neuer Zähler für Disk Full Zustand
+disk_full_counter = 0
 
 POST_PROCESSING_STATES = ["Verifying", "Extracting", "Moving", "Renaming", "Repairing", "Grabbing"]
 
 def log_message(message):
     """Prints a message with a timestamp."""
     print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {message}", flush=True)
+
+def parse_sab_size_string(size_str):
+    """Parses SABnzbd size string (e.g., "10.23 GB") into float in GB."""
+    try:
+        # SABnzbd usually reports GB, but handle other units if they appear
+        size_str = size_str.strip()
+        if size_str.endswith(' GB'):
+            return float(size_str.replace(' GB', ''))
+        elif size_str.endswith(' MB'):
+            return float(size_str.replace(' MB', '')) / 1024
+        elif size_str.endswith(' KB'):
+            return float(size_str.replace(' KB', '')) / (1024 * 1024)
+        return float(size_str) # Fallback if no unit or already a number
+    except ValueError:
+        return 0.0 # Return 0 if parsing fails
 
 def get_queue_info():
     """
@@ -52,15 +70,14 @@ def get_queue_info():
         overall_status = queue["status"]
         active_download_slots = int(queue["noofslots"])
 
-        # Disk space in GB (SABnzbd reports in GB, e.g., "10.23")
-        disk_space_free_gb = float(queue["diskspace1"])
-        # diskspace2 for completed folder, diskspace1 for temporary folder
+        disk_space_free_gb = parse_sab_size_string(queue["diskspace1"]) # Use diskspace1 for temp folder
+        # diskspace2 for completed folder
 
         is_post_processing_active = False
-        queue_items = [] # To store job details for potential deletion
+        queue_items = []
         if "slots" in queue:
             for job_slot in queue["slots"]:
-                queue_items.append(job_slot) # Store all job details
+                queue_items.append(job_slot)
                 if job_slot.get("status") in POST_PROCESSING_STATES:
                     is_post_processing_active = True
 
@@ -89,7 +106,7 @@ def resume_sabnzbd():
         log_message(f"⚠️  Error sending resume command: {e}")
         return False
 
-def delete_sabnzbd_job(nzo_id):
+def delete_sabnzbd_job(nzo_id, job_name="N/A"):
     """Deletes a specific job from the SABnzbd queue by nzo_id."""
     try:
         url = f"{SABNZBD_URL}/api?mode=queue&name=delete&value={nzo_id}&output=json&apikey={API_KEY}"
@@ -97,13 +114,13 @@ def delete_sabnzbd_job(nzo_id):
         resp.raise_for_status()
         data = resp.json()
         if data.get("status"):
-            log_message(f"✅ Job {nzo_id} successfully deleted from SABnzbd queue.")
+            log_message(f"✅ Job '{job_name}' (ID: {nzo_id}) successfully deleted from SABnzbd queue.")
             return True
         else:
-            log_message(f"❌ Failed to delete job {nzo_id} from SABnzbd queue: {data}")
+            log_message(f"❌ Failed to delete job '{job_name}' (ID: {nzo_id}) from SABnzbd queue: {data}")
             return False
     except requests.exceptions.RequestException as e:
-        log_message(f"⚠️  Error sending delete command for job {nzo_id}: {e}")
+        log_message(f"⚠️  Error sending delete command for job '{job_name}' (ID: {nzo_id}): {e}")
         return False
 
 log_message("🚀 SABnzbd Watchdog started")
@@ -132,7 +149,6 @@ while True:
         post_processing_active_counter = 0
 
     # --- Logik für Disk Full Management ---
-    # Nur prüfen, wenn Disk-Platz unter Schwellenwert UND Downloads laufen könnten oder hängen
     if disk_space_free_gb < DISK_FREE_THRESHOLD_GB:
         disk_full_counter += 1
         log_message(f"⚠️  Low disk space detected ({disk_space_free_gb:.2f} GB free, threshold {DISK_FREE_THRESHOLD_GB:.2f} GB) ({disk_full_counter}/{MAX_DISK_FULL_COUNT})")
@@ -140,77 +156,54 @@ while True:
         if disk_full_counter >= MAX_DISK_FULL_COUNT:
             log_message("🚨 Sustained low disk space detected. Evaluating downloads for deletion...")
 
-            # Find the currently downloading job (status 'Downloading')
-            current_download_job = None
+            job_to_delete = None
+            max_potential_size_gb = 0.0
+
+            # Finden des größten Jobs in der gesamten Queue (egal ob Downloading, Queued, Paused)
+            # der potenziell das Problem verursacht.
             for job in queue_items:
+                # Überspringe bereits abgeschlossene oder in der Nachbearbeitung befindliche Jobs
+                if job.get("status") in ["Completed", "Failed"] or job.get("status") in POST_PROCESSING_STATES:
+                    continue
+
+                # Für aktuell herunterladende Jobs, nutze 'sizeleft' als Indikator für den sofortigen Platzbedarf
                 if job.get("status") == "Downloading":
-                    current_download_job = job
-                    break
+                    job_current_size_check = parse_sab_size_string(job.get("sizeleft", "0 GB"))
+                else:
+                    # Für alle anderen Jobs (queued, paused etc.), nutze die Gesamtgröße 'size'
+                    job_current_size_check = parse_sab_size_string(job.get("size", "0 GB"))
 
-            if current_download_job:
-                nzo_id = current_download_job.get("nzo_id")
-                # SABnzbd reports 'size' for the full size, 'sizeleft' for remaining
-                # Both are strings, need to convert to float/int
-                try:
-                    total_size_gb = float(current_download_job.get("size", "0").replace(' GB', ''))
+                if job_current_size_check > max_potential_size_gb:
+                    max_potential_size_gb = job_current_size_check
+                    job_to_delete = job
 
-                    # If total_size_gb is not available or is 0, fall back to sizeleft
-                    if total_size_gb == 0:
-                        size_left_gb = float(current_download_job.get("sizeleft", "0").replace(' GB', ''))
-                        estimated_needed_gb = size_left_gb # Estimate based on remaining
-                    else:
-                        estimated_needed_gb = total_size_gb # Use total size if available
+            if job_to_delete:
+                nzo_id = job_to_delete.get("nzo_id")
+                job_name = job_to_delete.get("filename", "N/A")
+                estimated_needed_gb = parse_sab_size_string(job_to_delete.get("size", "0 GB")) # Gesamtgröße für Log
 
-                    log_message(f"ℹ️  Current download: '{current_download_job.get('filename', 'N/A')}' (ID: {nzo_id}), Total Size: {total_size_gb:.2f} GB, Estimated Needed: {estimated_needed_gb:.2f} GB")
+                log_message(f"ℹ️  Identified problematic job '{job_name}' (ID: {nzo_id}). Estimated total size: {estimated_needed_gb:.2f} GB.")
 
-                    # Fall 1: Download ist alleine schon zu groß
-                    if estimated_needed_gb > disk_space_free_gb + DISK_FREE_THRESHOLD_GB: # Add threshold for buffer
-                        log_message(f"🗑️  Current download is too large ({estimated_needed_gb:.2f} GB) for available space ({disk_space_free_gb:.2f} GB). Deleting...")
-                        delete_sabnzbd_job(nzo_id)
+                # Löschen, wenn der Job alleine zu groß ist
+                if estimated_needed_gb > (disk_space_free_gb + SIZE_CHECK_BUFFER_GB):
+                    log_message(f"🗑️  Job '{job_name}' is too large ({estimated_needed_gb:.2f} GB) for available space ({disk_space_free_gb:.2f} GB + {SIZE_CHECK_BUFFER_GB} GB buffer). Deleting...")
+                    if delete_sabnzbd_job(nzo_id, job_name):
                         disk_full_counter = 0 # Reset after action
-
-                    # Fall 2: Mehrere Downloads nehmen sich den Platz weg (eher unwahrscheinlich bei nur einem "Downloading" Job)
-                    # Dies würde bedeuten, dass der aktuelle Download alleine nicht zu groß ist,
-                    # aber der gesamte verfügbare Platz nicht ausreicht für alle geplanten Jobs.
-                    # Dies ist schwerer zu erkennen und zu handeln, da wir nicht wissen, welche
-                    # zukünftigen Jobs Platzprobleme verursachen könnten.
-                    # Die API-Felder 'size' und 'sizeleft' beziehen sich nur auf den Download.
-                    # Wenn nur EIN Download den Status "Downloading" hat, ist dieser Fall unwahrscheinlich.
-                    # Wenn es mehrere aktive Downloads gäbe, würde 'noofslots' > 1 sein.
-                    # Die SABnzbd Autopause würde hier in der Regel greifen.
-                    # Für eine präzise Umsetzung müsste man die *summierten* Größen der
-                    # nächsten n queued-Jobs berechnen, was die Logik komplex macht.
-                    # Fürs Erste konzentrieren wir uns auf den Download, der läuft oder gleich starten soll.
-
-                    # Simplere Annahme für "Platz weggenommen": Wenn immer noch wenig Platz
-                    # und kein einzelner Download zu groß ist, kann es nur durch die Summe
-                    # der Jobs kommen. Da wir den größten als ersten anpacken,
-                    # versuchen wir einfach zu löschen, wenn immer noch zu wenig Platz ist.
-                    # Wenn der erste Download nicht der Übeltäter ist, löschen wir den aktuell größten,
-                    # aber erst, nachdem wir geprüft haben, ob der laufende zu groß war.
-                    # Die Anforderung "zufällig 2 Downloads liefen welche sich gegenseitig den Platz weggenommen haben"
-                    # ist schwer zu automatisieren, da SABnzbd in der Regel nur 1-2 gleichzeitig herunterlädt
-                    # und die Hauptschuld dann doch beim größten ist, der kommt.
-                    # Die beste Strategie ist, den Job zu löschen, der gerade am meisten Platz braucht/brauchen würde.
-
-                    else:
-                        log_message(f"ℹ️  Current download is not too large for available space, but disk is still full.")
-                        # Wenn es mehrere Downloads in der Queue gibt, wäre der nächste Schritt
-                        # den größten anstehenden (nicht aktiven) Download zu löschen, wenn es immer noch knapp ist.
-                        # Wir löschen hier den aktuell aktiven Job, wenn kein anderer Ausweg.
-                        # Dies ist die robusteste, wenn auch manchmal aggressive, Strategie.
-                        log_message(f"🗑️  Deleting current downloading job '{current_download_job.get('filename', 'N/A')}' as a fallback for disk space issues.")
-                        delete_sabnzbd_job(nzo_id)
+                        sabnzbd_paused_counter = 0 # Reset paused counter as disk issue might be resolved
+                        post_processing_active_counter = 0 # Reset PP counter
+                else:
+                    # Wenn der größte Job alleine nicht zu groß ist, aber Disk immer noch voll,
+                    # dann liegt es an der Summe mehrerer Jobs oder einem anderen Problem.
+                    # Als Fallback löschen wir den identifizierten größten Job, um Platz zu schaffen.
+                    log_message(f"⚠️  Disk full, but largest identified job '{job_name}' ({estimated_needed_gb:.2f} GB) is not solely responsible for full disk. Deleting it as a primary measure to free space.")
+                    if delete_sabnzbd_job(nzo_id, job_name):
                         disk_full_counter = 0 # Reset after action
-
-
-                except ValueError as ve:
-                    log_message(f"❌ Error parsing size for job {nzo_id}: {ve}. Cannot determine if too large.")
-                    # In diesem Fall können wir nicht entscheiden und lassen den Counter weiterlaufen.
+                        sabnzbd_paused_counter = 0 # Reset paused counter as disk issue might be resolved
+                        post_processing_active_counter = 0 # Reset PP counter
             else:
-                log_message("⚠️  No active 'Downloading' job found despite low disk space. Cannot delete specific download.")
-                # Hier könnte man überlegen, den ältesten oder größten in der Warteschlange zu löschen,
-                # aber die Anweisung war spezifisch für den "aktuellen Download".
+                log_message("⚠️  Low disk space detected, but no suitable download job found in queue to delete.")
+                # disk_full_counter will continue to increment, potentially leading to no action
+                # if there are no deletable jobs. This prevents infinite loops.
 
     else: # Disk space is above threshold
         disk_full_counter = 0 # Reset counter if disk space is fine
